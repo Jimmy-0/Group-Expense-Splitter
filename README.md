@@ -4,12 +4,39 @@ A small full-stack app for friends splitting trip costs. Create a group, add mem
 (split equally, by exact amounts, or by percentages), and see balances plus a "settle up" plan with
 the fewest possible payments. Changes appear live in every open browser.
 
+## Demo
+
+Left: phone-sized browser (Ann). Right: a different browser (Bob). Bottom: the server.
+
+### Create a group and share the link
+![Creating a group with Ann, Bob and Cat and opening the link in a second browser](demo/gif/demo-expense-splitter-create_a_group_and_share.gif)
+### Add an expense: split equally
+![$100 split three ways into 33.34, 33.33 and 33.33](demo/gif/demo-expense-splitter-add_expense-split_equally.gif)
+### Add an expense: split by exact amounts
+![Exact amounts that must add up to the total](demo/gif/demo-expense-splitter-add_expense-split_by_amount.gif)
+### Add an expense: split by percentage
+![Percentage split with cent rounding](demo/gif/demo-expense-splitter-add_expense-split_percent.gif)
+### Delete an expense
+![Deleting an expense updates balances in both browsers](demo/gif/demo-expense-splitter-delete_expenses.gif)
+### Conflicting edits (optimistic concurrency control)
+![Two browsers edit the same expense; the second save is rejected with a conflict](demo/gif/demo-expense-splitter-optimistic_concurrency_control.gif)
+### Add a member
+![Adding a member after the group was created](demo/gif/demo-expense-splitter-add_new_member.gif)
+### Remove a member
+![Removing a member, blocked while they are in an expense](demo/gif/demo-expense-splitter-delete_member.gif)
+### Settle up
+![Recording settle-up payments until everyone is square](demo/gif/demo-expense-splitter-settle_the_expenses.gif)
+### Data persistence
+![Restarting the server keeps all data](demo/gif/demo-data_persistence.gif)
+
 ## Run it
 
 Requires **Node.js ≥ 22.13** (uses the built-in `node:sqlite`, so there is nothing native to compile
 and no database server to install).
 
 ```bash
+git clone https://github.com/Jimmy-0/Group-Expense-Splitter.git
+cd Group-Expense-Splitter
 npm install
 npm start            # builds the UI, serves UI + API on http://localhost:3000
 ```
@@ -28,6 +55,31 @@ Open the app on your phone using your machine's LAN IP (`npm run dev` binds Vite
 Over plain `http://<LAN-IP>` the browser hides the share/clipboard APIs, so "Share" shows the link to
 copy instead.
 
+### API docs (Swagger)
+
+With the server running (`npm start` or `npm run dev`), open **http://localhost:3000/api/docs**.
+The raw OpenAPI 3.1 spec is at http://localhost:3000/api/openapi.json, so you can import it into
+Postman or Insomnia or generate a client from it.
+
+To try a full flow in the browser:
+
+1. **Groups → `POST /api/groups` → Try it out → Execute.** The example creates "Lisbon trip" with
+   Ann, Bob and Cat. Copy `id` and the member `id`s from the response.
+2. **Expenses → `POST /api/groups/{groupId}/expenses`.** Paste the group id, then pick an example from
+   the *Examples* dropdown (`equal`, `exact`, `percent`). The examples use member ids 1, 2 and 3,
+   which only match the first group in a fresh database; otherwise replace them with the ids from
+   step 1.
+3. **Groups → `GET /api/groups/{groupId}`** shows balances and the settle-up plan, computed by the
+   server.
+4. **Settle up → `POST /api/groups/{groupId}/settlements`**: send one line of `settlements` from
+   step 3. Sending it a second time returns `409`.
+5. To edit or delete, pass the expense's current `version`. A stale version returns `409`.
+
+Try bad input too: `"amount": "1.005"` or percentages that don't add up to 100 return `400` with a
+readable message. `GET /api/groups/{groupId}/events` is a Server-Sent Events stream. It is
+documented in the spec, but Swagger UI can't display it; use
+`curl -N http://localhost:3000/api/groups/<id>/events` instead.
+
 ## Stack
 
 TypeScript end to end: Express 5 + zod on the server, SQLite via `node:sqlite`, React 19 + Vite on
@@ -35,12 +87,15 @@ the client. One language means the request/response types (`shared/types.ts`) an
 (`shared/money.ts`) are literally the same files on both sides.
 
 ```
-shared/money.ts   pure money logic: parsing, rounding, splits, balances, settle-up
-shared/types.ts   API types
-server/db.ts      schema + transaction helper
-server/app.ts     HTTP API, validation, SSE change feed
-server/*.test.ts  unit tests (money) and HTTP integration tests (API)
-web/src/          React UI
+shared/money.ts     pure money logic: parsing, rounding, splits, balances, settle-up
+shared/types.ts     API types
+shared/names.ts     member-name normalization (uniqueness key)
+server/db.ts        schema, migration, transaction helper
+server/app.ts       HTTP API, validation, SSE change feed
+server/openapi.ts   OpenAPI 3.1 spec served to Swagger UI
+server/index.ts     entry point; also serves the built UI
+server/*.test.ts    unit tests (money) and HTTP integration tests (API)
+web/src/            React UI
 ```
 
 ## Design decisions
@@ -71,9 +126,7 @@ web/src/          React UI
 
 ### API
 
-Interactive docs (Swagger UI, with "Try it out" and request examples for every split mode) are at
-**http://localhost:3000/api/docs**; the raw OpenAPI 3.1 spec is at `/api/openapi.json`
-(source: `server/openapi.ts`).
+Interactive docs are at **http://localhost:3000/api/docs** (see [API docs (Swagger)](#api-docs-swagger)).
 
 | Method | Path | |
 | --- | --- | --- |
@@ -165,8 +218,5 @@ expense_revisions(expense_id, version, action, snapshot, created_at)   append-on
 
 ## How I worked with the AI assistant
 
-I used an AI coding assistant (Claude) throughout. I made the design decisions up front (integer
-cents, largest-remainder rounding, server-authoritative math, versioned soft-deleted expenses with a
-revision log, SSE for live updates) and reviewed them before any code was written; the assistant then
-implemented, wrote the tests, and drove two real browser tabs to verify the flows (live sync,
-conflicting edits, payments, persistence across restart).
+I used omp AI agent harness tool for cost optimization concern throughout this project. I made the design decisions up front (integer cents, largest-remainder rounding, server-authoritative math, versioned soft-deleted expenses with a
+revision log, SSE for live updates) and reviewed them before any code was written; the assistant then spawn sub agents with predefined prompt to do the tasks including implementation, wrote the tests, and end to end verifications.
