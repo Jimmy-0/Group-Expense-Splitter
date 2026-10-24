@@ -4,6 +4,7 @@ import type { Server } from "node:http";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Expense, ExpenseRevision, GroupSnapshot } from "../shared/types.ts";
 import { createApp } from "./app.ts";
@@ -300,5 +301,119 @@ describe("persistence and live updates", () => {
     const { value } = await reader.read();
     expect(decoder.decode(value)).toContain("event: change");
     controller.abort();
+  });
+});
+
+describe("edge cases", () => {
+  it("records a settle-up payment once even if 'Paid' is pressed twice concurrently", async () => {
+    const { gid, ids } = await newGroup("Ann", "Bob");
+    await call("POST", `/groups/${gid}/expenses`, {
+      description: "x",
+      amount: "10",
+      paidBy: ids.Ann,
+      split: { mode: "equal", memberIds: [ids.Ann, ids.Bob] },
+    });
+    const transfer = { from: ids.Bob, to: ids.Ann, amountCents: 500 };
+    const results = await Promise.all([
+      call("POST", `/groups/${gid}/settlements`, transfer),
+      call("POST", `/groups/${gid}/settlements`, transfer),
+    ]);
+    expect(results.map((r) => r.status).sort()).toEqual([201, 409]);
+    const { data: g } = await call<GroupSnapshot>("GET", `/groups/${gid}`);
+    expect(g.settlements).toEqual([]);
+    const payment = g.expenses.find((e) => e.isPayment)!;
+    expect(payment.description).toBe("Bob paid Ann");
+    expect(payment.shares).toEqual([{ memberId: ids.Ann, input: 500, amountCents: 500 }]);
+  });
+
+  it("rejects a payment that is not in the current plan", async () => {
+    const { gid, ids } = await newGroup("Ann", "Bob");
+    const { status } = await call("POST", `/groups/${gid}/settlements`, { from: ids.Bob, to: ids.Ann, amountCents: 100 });
+    expect(status).toBe(409);
+  });
+
+  it("editing a payment keeps it marked as a payment", async () => {
+    const { gid, ids } = await newGroup("Ann", "Bob");
+    await call("POST", `/groups/${gid}/expenses`, {
+      description: "x",
+      amount: "10",
+      paidBy: ids.Ann,
+      split: { mode: "equal", memberIds: [ids.Ann, ids.Bob] },
+    });
+    const { data: p } = await call<Expense>("POST", `/groups/${gid}/settlements`, {
+      from: ids.Bob,
+      to: ids.Ann,
+      amountCents: 500,
+    });
+    const { data: edited } = await call<Expense>("PUT", `/groups/${gid}/expenses/${p.id}`, {
+      description: "Bob paid Ann (cash)",
+      amount: "5",
+      paidBy: ids.Bob,
+      version: 1,
+      split: { mode: "exact", shares: [{ memberId: ids.Ann, amount: "5" }] },
+    });
+    expect(edited.isPayment).toBe(true);
+  });
+
+  it("treats member names case-insensitively beyond ASCII, on every path", async () => {
+    expect((await call("POST", "/groups", { name: "t", members: ["Émile", "émile"] })).status).toBe(400);
+    const { gid } = await newGroup("Émile");
+    expect((await call("POST", `/groups/${gid}/members`, { name: "émile" })).status).toBe(409);
+    expect((await call("POST", `/groups/${gid}/members`, { name: "E\u0301MILE" })).status).toBe(409);
+  });
+
+  it("caps a group at 50 active members so an equal split can include everyone", async () => {
+    const { gid } = await newGroup(...Array.from({ length: 49 }, (_, i) => `M${i}`));
+    expect((await call("POST", `/groups/${gid}/members`, { name: "M49" })).status).toBe(201);
+    const over = await call("POST", `/groups/${gid}/members`, { name: "M50" });
+    expect(over.status).toBe(409);
+    const { data: g } = await call<GroupSnapshot>("GET", `/groups/${gid}`);
+    const all = g.members.map((m) => m.id);
+    const { status } = await call("POST", `/groups/${gid}/expenses`, {
+      description: "x",
+      amount: "100",
+      paidBy: all[0],
+      split: { mode: "equal", memberIds: all },
+    });
+    expect(status).toBe(201);
+  });
+
+  it("answers an oversized body with 413, not 500", async () => {
+    const { status, data } = await call("POST", "/groups", { name: "x".repeat(200_000), members: ["A"] });
+    expect(status).toBe(413);
+    expect(typeof data.error).toBe("string");
+  });
+
+  it("names a removed member when an open form submits them", async () => {
+    const { gid, ids } = await newGroup("Ann", "Bob");
+    await call("DELETE", `/groups/${gid}/members/${ids.Bob}`);
+    const { status, data } = await call("POST", `/groups/${gid}/expenses`, {
+      description: "x",
+      amount: "10",
+      paidBy: ids.Ann,
+      split: { mode: "equal", memberIds: [ids.Ann, ids.Bob] },
+    });
+    expect(status).toBe(400);
+    expect(data.error).toContain("Bob");
+  });
+
+  it("migrates a database created before name_key existed", () => {
+    const path = join(tmp, "legacy.db");
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      CREATE TABLE groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE members (id INTEGER PRIMARY KEY, group_id TEXT NOT NULL, name TEXT NOT NULL,
+        created_at TEXT NOT NULL, archived_at TEXT);
+      CREATE UNIQUE INDEX members_active_name ON members(group_id, name COLLATE NOCASE) WHERE archived_at IS NULL;
+      INSERT INTO groups VALUES ('g', 'Old', 'now');
+      INSERT INTO members (group_id, name, created_at) VALUES ('g', 'Émile', 'now');
+    `);
+    legacy.close();
+    const db = openDb(path);
+    expect(db.prepare("SELECT name_key FROM members").get()).toEqual({ name_key: "émile" });
+    expect(() =>
+      db.prepare("INSERT INTO members (group_id, name, name_key, created_at) VALUES ('g', 'ÉMILE', 'émile', 'now')").run(),
+    ).toThrow(/UNIQUE/);
+    db.close();
   });
 });

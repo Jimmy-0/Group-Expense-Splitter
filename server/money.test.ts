@@ -4,6 +4,7 @@ import {
   computeBalances,
   EXACT_SETTLE_LIMIT,
   MoneyError,
+  normalizeDecimalInput,
   parseBasisPoints,
   parseCents,
   resolveSplit,
@@ -18,14 +19,34 @@ describe("parseCents", () => {
     ["0.01", 1],
     ["33.33", 3333],
     [" 7.10 ", 710],
+    [".5", 50],
+    ["5.", 500],
   ])("parses %j", (raw, cents) => expect(parseCents(raw)).toBe(cents));
 
-  it.each(["", "-5", "1.234", "1e3", "abc", "1,000", ".5", "NaN", "100000000"])("rejects %j", (raw) =>
+  it.each(["", ".", "-5", "1.234", "1e3", "abc", "1,000", "NaN", "100000000", "1.2.3"])("rejects %j", (raw) =>
     expect(() => parseCents(raw)).toThrow(MoneyError),
   );
 });
 
+describe("normalizeDecimalInput", () => {
+  it.each([
+    ["$ 1,234.50", "1234.50"],
+    ["12,5", "12.5"],
+    ["12,50", "12.50"],
+    ["1,234", "1234"],
+    ["1,234,567", "1234567"],
+    ["33,33 %", "33.33"],
+    [".5", ".5"],
+  ])("%j -> %j", (raw, out) => expect(normalizeDecimalInput(raw)).toBe(out));
+
+  it("normalized phone input parses to the intended cents", () => {
+    expect(parseCents(normalizeDecimalInput("$1,234.5"))).toBe(123450);
+    expect(parseCents(normalizeDecimalInput("0,99"))).toBe(99);
+  });
+});
+
 describe("parseBasisPoints", () => {
+  it("accepts a leading dot", () => expect(parseBasisPoints(".5")).toBe(50));
   it("parses decimals", () => expect(parseBasisPoints("33.33")).toBe(3333));
   it("rejects over 100%", () => expect(() => parseBasisPoints("100.01")).toThrow(MoneyError));
   it("rejects 3 decimals", () => expect(() => parseBasisPoints("33.333")).toThrow(MoneyError));

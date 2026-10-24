@@ -3,6 +3,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import { z } from "zod";
 import { computeBalances, MoneyError, parseCents, resolveSplit, settleUp } from "../shared/money.ts";
 import type { Expense, ExpenseRevision, ExpenseShare, GroupSnapshot, Member, SplitMode } from "../shared/types.ts";
+import { memberNameKey } from "../shared/names.ts";
 import { type Db, transaction } from "./db.ts";
 
 class HttpError extends Error {
@@ -21,9 +22,12 @@ const name = (max: number) => z.string().trim().min(1, "must not be empty").max(
 const id = z.number().int().positive();
 const decimal = z.string().max(20);
 
+/** Members per group. Matches the split-size limit so an equal split can always include everyone. */
+export const MAX_MEMBERS = 50;
+
 const createGroupBody = z.object({
   name: name(60),
-  members: z.array(name(40)).min(1, "add at least one member").max(50),
+  members: z.array(name(40)).min(1, "add at least one member").max(MAX_MEMBERS),
 });
 
 const addMemberBody = z.object({ name: name(40) });
@@ -32,13 +36,17 @@ const expenseBody = z.object({
   description: name(120),
   amount: decimal,
   paidBy: id,
-  isPayment: z.boolean().optional().default(false),
   split: z.discriminatedUnion("mode", [
-    z.object({ mode: z.literal("equal"), memberIds: z.array(id).max(50) }),
-    z.object({ mode: z.literal("exact"), shares: z.array(z.object({ memberId: id, amount: decimal })).max(50) }),
-    z.object({ mode: z.literal("percent"), shares: z.array(z.object({ memberId: id, percent: decimal })).max(50) }),
+    z.object({ mode: z.literal("equal"), memberIds: z.array(id).max(MAX_MEMBERS) }),
+    z.object({ mode: z.literal("exact"), shares: z.array(z.object({ memberId: id, amount: decimal })).max(MAX_MEMBERS) }),
+    z.object({
+      mode: z.literal("percent"),
+      shares: z.array(z.object({ memberId: id, percent: decimal })).max(MAX_MEMBERS),
+    }),
   ]),
 });
+
+const settlementBody = z.object({ from: id, to: id, amountCents: z.number().int().positive() });
 
 const updateExpenseBody = expenseBody.extend({ version: z.number().int().positive() });
 
@@ -175,16 +183,19 @@ export function createApp(db: Db, feed = new ChangeFeed()) {
       if (err instanceof MoneyError) throw new HttpError(400, err.message);
       throw err;
     }
-    const active = new Set(
-      (
-        db.prepare("SELECT id FROM members WHERE group_id = ? AND archived_at IS NULL").all(groupId) as {
-          id: number;
-        }[]
-      ).map((r) => r.id),
-    );
-    if (!active.has(body.paidBy)) throw new HttpError(400, "paidBy is not an active member of this group");
+    const rows = db.prepare("SELECT id, name, archived_at FROM members WHERE group_id = ?").all(groupId) as unknown as MemberRow[];
+    const active = new Set(rows.filter((r) => r.archived_at === null).map((r) => r.id));
+    // Name the person when we can: usually someone was removed while this form was open.
+    const notActive = (memberId: number, role: string) => {
+      const known = rows.find((r) => r.id === memberId);
+      return new HttpError(
+        400,
+        known ? `${known.name} (${role}) is no longer a member of this group` : `${role} is not a member of this group`,
+      );
+    };
+    if (!active.has(body.paidBy)) throw notActive(body.paidBy, "payer");
     const stranger = shares.find((s) => !active.has(s.memberId));
-    if (stranger) throw new HttpError(400, `member ${stranger.memberId} is not an active member of this group`);
+    if (stranger) throw notActive(stranger.memberId, "in the split");
     if (shares.every((s) => s.amountCents === 0)) throw new HttpError(400, "nobody owes anything in this split");
     return { amountCents, shares };
   };
@@ -211,6 +222,24 @@ export function createApp(db: Db, feed = new ChangeFeed()) {
     for (const s of shares) stmt.run(expenseId, s.memberId, s.input, s.amountCents);
   };
 
+  const insertExpense = (
+    groupId: string,
+    e: { description: string; amountCents: number; paidBy: number; mode: SplitMode; isPayment: boolean },
+    shares: ExpenseShare[],
+    at: string,
+  ) => {
+    const { lastInsertRowid } = db
+      .prepare(
+        `INSERT INTO expenses (group_id, description, amount_cents, paid_by, split_mode, is_payment, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(groupId, e.description, e.amountCents, e.paidBy, e.mode, e.isPayment ? 1 : 0, at, at);
+    const expenseId = Number(lastInsertRowid);
+    insertSplits(expenseId, shares);
+    writeRevision(expenseId, 1, "create", at);
+    return expenseId;
+  };
+
   const assertVersion = (groupId: string, expenseId: number, version: number) => {
     const current = loadExpense(groupId, expenseId);
     if (current.version !== version) {
@@ -223,14 +252,14 @@ export function createApp(db: Db, feed = new ChangeFeed()) {
 
   app.post("/api/groups", (req, res) => {
     const body = parse(createGroupBody, req.body);
-    const lower = body.members.map((m) => m.toLowerCase());
-    if (new Set(lower).size !== lower.length) throw new HttpError(400, "member names must be unique");
+    const keys = body.members.map(memberNameKey);
+    if (new Set(keys).size !== keys.length) throw new HttpError(400, "member names must be unique");
     const groupId = randomBytes(9).toString("base64url");
     const at = now();
     transaction(db, () => {
       db.prepare("INSERT INTO groups (id, name, created_at) VALUES (?, ?, ?)").run(groupId, body.name, at);
-      const stmt = db.prepare("INSERT INTO members (group_id, name, created_at) VALUES (?, ?, ?)");
-      for (const m of body.members) stmt.run(groupId, m, at);
+      const stmt = db.prepare("INSERT INTO members (group_id, name, name_key, created_at) VALUES (?, ?, ?, ?)");
+      body.members.forEach((m, i) => stmt.run(groupId, m, keys[i]!, at));
     });
     res.status(201).json(snapshot(groupId));
   });
@@ -257,12 +286,23 @@ export function createApp(db: Db, feed = new ChangeFeed()) {
     const { groupId } = req.params;
     requireGroup(groupId);
     const body = parse(addMemberBody, req.body);
-    try {
-      db.prepare("INSERT INTO members (group_id, name, created_at) VALUES (?, ?, ?)").run(groupId, body.name, now());
-    } catch (err) {
-      if (String(err).includes("UNIQUE")) throw new HttpError(409, `a member named "${body.name}" already exists`);
-      throw err;
-    }
+    transaction(db, () => {
+      const { n } = db
+        .prepare("SELECT COUNT(*) AS n FROM members WHERE group_id = ? AND archived_at IS NULL")
+        .get(groupId) as { n: number };
+      if (n >= MAX_MEMBERS) throw new HttpError(409, `a group can have at most ${MAX_MEMBERS} members`);
+      try {
+        db.prepare("INSERT INTO members (group_id, name, name_key, created_at) VALUES (?, ?, ?, ?)").run(
+          groupId,
+          body.name,
+          memberNameKey(body.name),
+          now(),
+        );
+      } catch (err) {
+        if (String(err).includes("UNIQUE")) throw new HttpError(409, `a member named "${body.name}" already exists`);
+        throw err;
+      }
+    });
     feed.publish(groupId);
     res.status(201).json(snapshot(groupId));
   });
@@ -295,18 +335,14 @@ export function createApp(db: Db, feed = new ChangeFeed()) {
     const body = parse(expenseBody, req.body);
     const { amountCents, shares } = resolveExpense(groupId, body);
     const at = now();
-    const expenseId = transaction(db, () => {
-      const { lastInsertRowid } = db
-        .prepare(
-          `INSERT INTO expenses (group_id, description, amount_cents, paid_by, split_mode, is_payment, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(groupId, body.description, amountCents, body.paidBy, body.split.mode, body.isPayment ? 1 : 0, at, at);
-      const expenseId = Number(lastInsertRowid);
-      insertSplits(expenseId, shares);
-      writeRevision(expenseId, 1, "create", at);
-      return expenseId;
-    });
+    const expenseId = transaction(db, () =>
+      insertExpense(
+        groupId,
+        { description: body.description, amountCents, paidBy: body.paidBy, mode: body.split.mode, isPayment: false },
+        shares,
+        at,
+      ),
+    );
     feed.publish(groupId);
     res.status(201).json(loadExpense(groupId, expenseId));
   });
@@ -321,9 +357,9 @@ export function createApp(db: Db, feed = new ChangeFeed()) {
     transaction(db, () => {
       assertVersion(groupId, expenseId, body.version);
       db.prepare(
-        `UPDATE expenses SET description = ?, amount_cents = ?, paid_by = ?, split_mode = ?, is_payment = ?,
+        `UPDATE expenses SET description = ?, amount_cents = ?, paid_by = ?, split_mode = ?,
            version = version + 1, updated_at = ? WHERE id = ?`,
-      ).run(body.description, amountCents, body.paidBy, body.split.mode, body.isPayment ? 1 : 0, at, expenseId);
+      ).run(body.description, amountCents, body.paidBy, body.split.mode, at, expenseId);
       db.prepare("DELETE FROM expense_splits WHERE expense_id = ?").run(expenseId);
       insertSplits(expenseId, shares);
       writeRevision(expenseId, body.version + 1, "update", at);
@@ -350,6 +386,40 @@ export function createApp(db: Db, feed = new ChangeFeed()) {
     });
     feed.publish(groupId);
     res.status(204).end();
+  });
+
+  // Record that someone paid a line of the settle-up plan. The transfer must still be in the
+  // current plan, so a double tap or two people pressing "Paid" at once records it only once.
+  app.post("/api/groups/:groupId/settlements", (req, res) => {
+    const { groupId } = req.params;
+    const body = parse(settlementBody, req.body);
+    const at = now();
+    const expenseId = transaction(db, () => {
+      const current = snapshot(groupId);
+      const planned = current.settlements.some(
+        (t) => t.from === body.from && t.to === body.to && t.amountCents === body.amountCents,
+      );
+      if (!planned) {
+        throw new HttpError(409, "this payment is no longer in the settle-up plan; it may already be recorded", {
+          settlements: current.settlements,
+        });
+      }
+      const nameOf = (mid: number) => current.members.find((m) => m.id === mid)!.name;
+      return insertExpense(
+        groupId,
+        {
+          description: `${nameOf(body.from)} paid ${nameOf(body.to)}`,
+          amountCents: body.amountCents,
+          paidBy: body.from,
+          mode: "exact",
+          isPayment: true,
+        },
+        [{ memberId: body.to, input: body.amountCents, amountCents: body.amountCents }],
+        at,
+      );
+    });
+    feed.publish(groupId);
+    res.status(201).json(loadExpense(groupId, expenseId));
   });
 
   app.get("/api/groups/:groupId/expenses/:expenseId/history", (req, res) => {
@@ -385,6 +455,12 @@ export function createApp(db: Db, feed = new ChangeFeed()) {
     }
     if (err instanceof SyntaxError && "body" in err) {
       res.status(400).json({ error: "request body is not valid JSON" });
+      return;
+    }
+    // body-parser errors (413 too large, 415 unsupported charset, ...) carry their own 4xx status.
+    const status = (err as { status?: unknown }).status;
+    if (typeof status === "number" && status >= 400 && status < 500) {
+      res.status(status).json({ error: (err as Error).message });
       return;
     }
     console.error(err);

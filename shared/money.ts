@@ -8,16 +8,29 @@ export class MoneyError extends Error {}
 export const MAX_CENTS = 1_000_000_000;
 export const FULL_PERCENT_BP = 10_000; // 100.00% in basis points
 
-const AMOUNT_RE = /^(\d{1,8})(?:\.(\d{1,2}))?$/;
-const PERCENT_RE = /^(\d{1,3})(?:\.(\d{1,2}))?$/;
+// Integer part may be empty (".5") and the fraction may be empty ("5."), but at least one digit is required.
+const AMOUNT_RE = /^(?=\.?\d)(\d{0,8})(?:\.(\d{0,2}))?$/;
+const PERCENT_RE = /^(?=\.?\d)(\d{0,3})(?:\.(\d{0,2}))?$/;
 
-/** "12.5" -> 1250. Rejects negatives, >2 decimals, exponents, and anything non-decimal. */
+/** "12.5" -> 1250, ".5" -> 50. Rejects negatives, >2 decimals, exponents, separators, and anything non-decimal. */
 export function parseCents(raw: string, field = "amount"): number {
   const m = AMOUNT_RE.exec(raw.trim());
   if (!m) throw new MoneyError(`${field} must be a positive decimal with at most 2 decimal places, got "${raw}"`);
   const cents = Number(m[1]) * 100 + Number((m[2] ?? "").padEnd(2, "0"));
   if (cents > MAX_CENTS) throw new MoneyError(`${field} exceeds the maximum of ${formatCents(MAX_CENTS)}`);
   return cents;
+}
+
+/**
+ * Normalize what people type on a phone into the strict API format:
+ * "$ 1,234.50" -> "1234.50", "12,5" -> "12.5" (comma as decimal mark), "1,234" -> "1234".
+ * The API itself stays strict; this only runs in the UI.
+ */
+export function normalizeDecimalInput(raw: string): string {
+  const v = raw.replace(/[\s$%]/g, "");
+  if (v.includes(".")) return v.replaceAll(",", "");
+  if (/^\d*,\d{1,2}$/.test(v)) return v.replace(",", ".");
+  return v.replaceAll(",", "");
 }
 
 /** "33.33" -> 3333 basis points. */

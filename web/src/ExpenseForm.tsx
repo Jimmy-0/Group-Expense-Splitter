@@ -1,5 +1,13 @@
 import { type FormEvent, useState } from "react";
-import { centsToDecimal, formatCents, MoneyError, parseCents, resolveSplit, type SplitInput } from "../../shared/money.ts";
+import {
+  centsToDecimal,
+  formatCents,
+  MoneyError,
+  normalizeDecimalInput,
+  parseCents,
+  resolveSplit,
+  type SplitInput,
+} from "../../shared/money.ts";
 import type { Expense, ExpenseRevision, Member, SplitMode } from "../../shared/types.ts";
 import { api, RequestError } from "./api.ts";
 
@@ -42,18 +50,26 @@ export function ExpenseForm({ groupId, members, allMembers, defaultPayer, expens
     mode === "equal"
       ? { mode, memberIds: members.filter((m) => equalIds.includes(m.id)).map((m) => m.id) }
       : mode === "exact"
-        ? { mode, shares: members.filter((m) => exact[m.id]?.trim()).map((m) => ({ memberId: m.id, amount: exact[m.id]! })) }
+        ? {
+            mode,
+            shares: members
+              .filter((m) => exact[m.id]?.trim())
+              .map((m) => ({ memberId: m.id, amount: normalizeDecimalInput(exact[m.id]!) })),
+          }
         : {
             mode,
-            shares: members.filter((m) => percent[m.id]?.trim()).map((m) => ({ memberId: m.id, percent: percent[m.id]! })),
+            shares: members
+              .filter((m) => percent[m.id]?.trim())
+              .map((m) => ({ memberId: m.id, percent: normalizeDecimalInput(percent[m.id]!) })),
           };
+  const normalizedAmount = normalizeDecimalInput(amount);
 
   // Live preview with the same rounding code the server uses; the server stays authoritative.
   let totalCents: number | null = null;
   let preview: Map<number, number> | null = null;
   let previewError: string | null = null;
   try {
-    totalCents = parseCents(amount || "0");
+    totalCents = parseCents(normalizedAmount || "0");
     if (totalCents > 0) preview = new Map(resolveSplit(totalCents, split).map((s) => [s.memberId, s.amountCents]));
   } catch (err) {
     if (!(err instanceof MoneyError)) throw err;
@@ -65,7 +81,7 @@ export function ExpenseForm({ groupId, members, allMembers, defaultPayer, expens
       let sum = 0;
       for (const m of members) {
         try {
-          sum += exact[m.id]?.trim() ? parseCents(exact[m.id]!) : 0;
+          sum += exact[m.id]?.trim() ? parseCents(normalizeDecimalInput(exact[m.id]!)) : 0;
         } catch {
           return null;
         }
@@ -73,7 +89,7 @@ export function ExpenseForm({ groupId, members, allMembers, defaultPayer, expens
       return `${formatCents(totalCents - sum)} left`;
     }
     if (mode === "percent") {
-      const sum = members.reduce((a, m) => a + (Number(percent[m.id]) || 0), 0);
+      const sum = members.reduce((a, m) => a + (Number(normalizeDecimalInput(percent[m.id] ?? "")) || 0), 0);
       return `${(100 - sum).toFixed(2).replace(/\.00$/, "")}% left`;
     }
     return null;
@@ -84,7 +100,7 @@ export function ExpenseForm({ groupId, members, allMembers, defaultPayer, expens
     if (paidBy === null) return;
     setBusy(true);
     setError(null);
-    const input = { description: description.trim() || "Expense", amount, paidBy, split, isPayment: expense?.isPayment };
+    const input = { description: description.trim() || "Expense", amount: normalizedAmount, paidBy, split };
     try {
       if (expense) await api.updateExpense(groupId, expense.id, { ...input, version: expense.version });
       else await api.createExpense(groupId, input);
@@ -130,7 +146,7 @@ export function ExpenseForm({ groupId, members, allMembers, defaultPayer, expens
             autoFocus={!expense}
             placeholder="0.00"
             value={amount}
-            onChange={(e) => setAmount(e.target.value.replace(",", "."))}
+            onChange={(e) => setAmount(e.target.value)}
             aria-label="Amount"
             required
           />
@@ -192,7 +208,7 @@ export function ExpenseForm({ groupId, members, allMembers, defaultPayer, expens
                       placeholder={mode === "exact" ? "0.00" : "0"}
                       value={(mode === "exact" ? exact : percent)[m.id] ?? ""}
                       onChange={(e) => {
-                        const v = e.target.value.replace(",", ".");
+                        const v = e.target.value;
                         if (mode === "exact") setExact({ ...exact, [m.id]: v });
                         else setPercent({ ...percent, [m.id]: v });
                       }}

@@ -25,6 +25,8 @@ npm run typecheck
 ```
 
 Open the app on your phone using your machine's LAN IP (`npm run dev` binds Vite to all interfaces).
+Over plain `http://<LAN-IP>` the browser hides the share/clipboard APIs, so "Share" shows the link to
+copy instead.
 
 ## Stack
 
@@ -47,7 +49,9 @@ web/src/          React UI
 
 - **Integer cents everywhere.** Amounts travel as decimal strings (`"100.00"`) and are parsed with a
   regex into integer cents; JSON numbers are rejected for money so `0.1 + 0.2` problems cannot enter.
-  Max 2 decimals, must be > 0, capped at $10M so every intermediate product stays exact.
+  Max 2 decimals, must be > 0, capped at $10M so every intermediate product stays exact. `.5` and `5.`
+  are accepted. The API is strict (no `$`, no thousands separators); the UI normalizes what people
+  type on phones first (`$1,234.50` → `1234.50`, `12,5` → `12.5`).
 - **Rounding = largest remainder method.** Each person gets the floor of their exact share; the
   leftover cents go to the largest fractional remainders, ties broken by member order. Shares always
   add up to the total exactly. `$100 / 3` → `33.34, 33.33, 33.33`. Percent splits use the same code
@@ -77,20 +81,22 @@ web/src/          React UI
 | `PUT` | `/api/groups/:id/expenses/:expenseId` | same body + `version` |
 | `DELETE` | `/api/groups/:id/expenses/:expenseId?version=n` | soft delete |
 | `GET` | `/api/groups/:id/expenses/:expenseId/history` | every revision |
+| `POST` | `/api/groups/:id/settlements` | `{ from, to, amountCents }`: record a settle-up payment; 409 unless it's in the current plan |
 | `GET` | `/api/groups/:id/events` | Server-Sent Events: `change` whenever the group changes |
 
 `split` is one of `{ mode: "equal", memberIds }`, `{ mode: "exact", shares: [{ memberId, amount }] }`,
 `{ mode: "percent", shares: [{ memberId, percent }] }`.
 
 Validation: zod for shape (400 with per-field details), then money rules (400 with a readable
-message), then group membership (payer and every share must be an active member of *this* group).
-404 for unknown groups/expenses, 409 for conflicts.
+message), then group membership (payer and every share must be an active member of *this* group;
+the error names the person, e.g. when someone was removed while a form was open).
+404 for unknown groups/expenses, 409 for conflicts, 413 for oversized bodies.
 
 ### Data model
 
 ```
 groups(id, name, created_at)
-members(id, group_id, name, archived_at)                  unique active name per group
+members(id, group_id, name, name_key, archived_at)        unique active name_key per group
 expenses(id, group_id, description, amount_cents, paid_by, split_mode, is_payment,
          version, created_at, updated_at, deleted_at)
 expense_splits(expense_id, member_id, input_value, amount_cents)
@@ -106,9 +112,16 @@ expense_revisions(expense_id, version, action, snapshot, created_at)   append-on
   edit the same expense, the second gets a 409 instead of silently overwriting the first.
 - **Members are archived, never deleted**, and only when they are not in any active expense, so old
   revisions still resolve names and balances can never reference a missing person.
-- **"Paid" on a settle-up line** records a normal expense (`is_payment = 1`) where the debtor pays
-  and the creditor owes the full amount. No separate payments table, and balance math stays a
-  single code path.
+- **Member names are unique per group regardless of case or Unicode form** (`Émile` = `émile`).
+  SQLite's `NOCASE` only folds ASCII, so the app stores `name_key` (NFKC + lowercase) and indexes
+  that. Older databases are migrated in place on startup.
+- **At most 50 active members per group**, the same as the split-size limit, so an equal split can
+  always include everyone.
+- **"Paid" on a settle-up line** calls `POST /settlements`, which records a normal expense
+  (`is_payment = 1`) where the debtor pays and the creditor owes the full amount. The server checks
+  inside the write transaction that this exact transfer is still in the current plan, so a double
+  tap or two people pressing "Paid" at once records it only once. No separate payments table, so
+  balance math stays a single code path. Editing a payment keeps it marked as a payment.
 
 ### Frontend
 
@@ -117,8 +130,11 @@ expense_revisions(expense_id, version, action, snapshot, created_at)   append-on
   device), split defaulting to *everyone equally*. Typical entry: amount, description, tap Save.
 - The settle-up plan is the first thing on the page ("Bob pays Ann $33.33"), then balances in
   green/red.
-- Live sync: each page holds an `EventSource`; on `change` (or when the tab becomes visible again)
-  it refetches the group snapshot. `EventSource` reconnects by itself after a server restart.
+- Live sync: each visible page holds an `EventSource`; on `change` it refetches the group snapshot.
+  Hidden tabs close their stream and refetch when they become visible again, because browsers allow
+  only ~6 HTTP/1.1 connections per host and background streams would starve the foreground tab.
+  After any failed action (e.g. a 409) the page also refetches, since a failure usually means the
+  view is stale. `EventSource` reconnects by itself after a server restart.
 
 ## Tradeoffs and limitations
 

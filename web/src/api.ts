@@ -1,4 +1,4 @@
-import type { ApiError, Expense, ExpenseInput, ExpenseRevision, GroupSnapshot } from "../../shared/types.ts";
+import type { ApiError, Expense, ExpenseInput, ExpenseRevision, GroupSnapshot, Transfer } from "../../shared/types.ts";
 
 export class RequestError extends Error {
   constructor(
@@ -37,6 +37,7 @@ export const api = {
     request<Expense>("PUT", `/groups/${id}/expenses/${expenseId}`, input),
   deleteExpense: (id: string, expenseId: number, version: number) =>
     request<void>("DELETE", `/groups/${id}/expenses/${expenseId}?version=${version}`),
+  settle: (id: string, t: Transfer) => request<Expense>("POST", `/groups/${id}/settlements`, t),
   history: (id: string, expenseId: number) =>
     request<ExpenseRevision[]>("GET", `/groups/${id}/expenses/${expenseId}/history`),
 };

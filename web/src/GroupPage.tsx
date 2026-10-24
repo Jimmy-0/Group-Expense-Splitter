@@ -1,5 +1,5 @@
 import { type FormEvent, useCallback, useEffect, useState } from "react";
-import { centsToDecimal, formatCents } from "../../shared/money.ts";
+import { formatCents } from "../../shared/money.ts";
 import type { Expense, GroupSnapshot, Transfer } from "../../shared/types.ts";
 import { api } from "./api.ts";
 import { ExpenseForm } from "./ExpenseForm.tsx";
@@ -11,9 +11,10 @@ export function GroupPage({ groupId }: { groupId: string }) {
   const [group, setGroup] = useState<GroupSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<Editing>(null);
-  const [me, setMeState] = useState<number | null>(() => getMe(groupId));
+  const [storedMe, setMeState] = useState<number | null>(() => getMe(groupId));
   const [newMember, setNewMember] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
+  const [paying, setPaying] = useState<string | null>(null);
 
   const reload = useCallback(async () => {
     try {
@@ -26,16 +27,31 @@ export function GroupPage({ groupId }: { groupId: string }) {
     }
   }, [groupId]);
 
-  // Live sync: the server pushes a "change" event whenever anyone edits this group.
+  // Live sync: the server pushes a "change" event whenever anyone edits this group. The stream is
+  // only open while the tab is visible: browsers allow ~6 HTTP/1.1 connections per host, so
+  // background tabs holding streams would eventually block requests from the foreground tab.
   useEffect(() => {
+    let events: EventSource | null = null;
+    const connect = () => {
+      events?.close();
+      events = new EventSource(`/api/groups/${groupId}/events`);
+      events.addEventListener("change", () => void reload());
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        connect();
+        void reload();
+      } else {
+        events?.close();
+        events = null;
+      }
+    };
     void reload();
-    const events = new EventSource(`/api/groups/${groupId}/events`);
-    events.addEventListener("change", () => void reload());
-    const onVisible = () => document.visibilityState === "visible" && void reload();
-    document.addEventListener("visibilitychange", onVisible);
+    if (document.visibilityState === "visible") connect();
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
-      events.close();
-      document.removeEventListener("visibilitychange", onVisible);
+      events?.close();
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [groupId, reload]);
 
@@ -44,28 +60,27 @@ export function GroupPage({ groupId }: { groupId: string }) {
   }
 
   const active = group.members.filter((m) => !m.archived);
+  // The remembered "me" may have been removed from the group on another device.
+  const me = active.some((m) => m.id === storedMe) ? storedMe : null;
   const nameOf = (id: number) => group.members.find((m) => m.id === id)?.name ?? "?";
 
+  // Always refetch afterwards: a failed action (409, removed member) usually means our view is stale.
   async function act(fn: () => Promise<unknown>) {
+    setNotice(null);
     try {
-      setNotice(null);
       await fn();
-      await reload();
     } catch (err) {
       setNotice((err as Error).message);
     }
+    await reload();
   }
 
-  const recordPayment = (t: Transfer) =>
-    act(() =>
-      api.createExpense(groupId, {
-        description: `${nameOf(t.from)} paid ${nameOf(t.to)}`,
-        amount: centsToDecimal(t.amountCents),
-        paidBy: t.from,
-        isPayment: true,
-        split: { mode: "exact", shares: [{ memberId: t.to, amount: centsToDecimal(t.amountCents) }] },
-      }),
-    );
+  async function recordPayment(t: Transfer) {
+    if (paying) return;
+    setPaying(`${t.from}-${t.to}`);
+    await act(() => api.settle(groupId, t));
+    setPaying(null);
+  }
 
   async function addMember(e: FormEvent) {
     e.preventDefault();
@@ -76,11 +91,17 @@ export function GroupPage({ groupId }: { groupId: string }) {
   }
 
   async function share() {
+    // share/clipboard only exist in secure contexts (https or localhost), not on http://<LAN-IP>.
     const url = location.href;
-    if (navigator.share) await navigator.share({ title: group!.name, url }).catch(() => {});
-    else {
+    if (navigator.share) {
+      await navigator.share({ title: group!.name, url }).catch(() => {});
+      return;
+    }
+    try {
       await navigator.clipboard.writeText(url);
       setNotice("Link copied");
+    } catch {
+      setNotice(`Copy this link to share: ${url}`);
     }
   }
 
@@ -135,7 +156,7 @@ export function GroupPage({ groupId }: { groupId: string }) {
                   <b>{nameOf(t.from)}</b> pays <b>{nameOf(t.to)}</b>
                 </span>
                 <span className="amount">{formatCents(t.amountCents)}</span>
-                <button className="small" onClick={() => recordPayment(t)}>
+                <button className="small" onClick={() => recordPayment(t)} disabled={paying !== null}>
                   Paid
                 </button>
               </li>

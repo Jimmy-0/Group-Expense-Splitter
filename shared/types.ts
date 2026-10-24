@@ -65,7 +65,6 @@ export interface ExpenseInput {
   description: string;
   amount: string;
   paidBy: number;
-  isPayment?: boolean;
   split:
     | { mode: "equal"; memberIds: number[] }
     | { mode: "exact"; shares: { memberId: number; amount: string }[] }
