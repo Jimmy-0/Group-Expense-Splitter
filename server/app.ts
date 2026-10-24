@@ -1,10 +1,12 @@
 import { randomBytes } from "node:crypto";
 import express, { type NextFunction, type Request, type Response } from "express";
+import swaggerUi from "swagger-ui-express";
 import { z } from "zod";
 import { computeBalances, MoneyError, parseCents, resolveSplit, settleUp } from "../shared/money.ts";
 import type { Expense, ExpenseRevision, ExpenseShare, GroupSnapshot, Member, SplitMode } from "../shared/types.ts";
 import { memberNameKey } from "../shared/names.ts";
 import { type Db, transaction } from "./db.ts";
+import { openapi } from "./openapi.ts";
 
 class HttpError extends Error {
   constructor(
@@ -445,6 +447,11 @@ export function createApp(db: Db, feed = new ChangeFeed()) {
     }));
     res.json(history);
   });
+
+  app.get("/api/openapi.json", (_req, res) => {
+    res.json(openapi);
+  });
+  app.use("/api/docs", swaggerUi.serve, swaggerUi.setup(openapi, { customSiteTitle: "Split API" }));
 
   app.use("/api", (_req, _res, next) => next(new HttpError(404, "not found")));
 

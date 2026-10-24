@@ -71,6 +71,10 @@ web/src/          React UI
 
 ### API
 
+Interactive docs (Swagger UI, with "Try it out" and request examples for every split mode) are at
+**http://localhost:3000/api/docs**; the raw OpenAPI 3.1 spec is at `/api/openapi.json`
+(source: `server/openapi.ts`).
+
 | Method | Path | |
 | --- | --- | --- |
 | `POST` | `/api/groups` | `{ name, members: string[] }` |
